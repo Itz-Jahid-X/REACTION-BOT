@@ -1,0 +1,7 @@
+python-telegram-bot==21.6
+httpx==0.28.1
+anyio>=4.0.0
+certifi
+httpcore==1.*
+h11>=0.16
+typing_extensions>=4.5.0
