@@ -8,16 +8,7 @@ from telegram import Update, ReactionTypeEmoji
 from telegram.ext import Application, MessageHandler, filters
 
 # ------------------------------------------------------------------
-# 1. Configuration
-# ------------------------------------------------------------------
-BOT_TOKEN = os.getenv("BOT_TOKEN")  # Must be set in Vercel environment
-if not BOT_TOKEN:
-    raise ValueError("BOT_TOKEN environment variable is not set")
-
-REACTIONS = ["👍", "❤️", "🔥", "🥰", "👏", "💯", "⚡"]
-
-# ------------------------------------------------------------------
-# 2. Logging setup (structured and production-friendly)
+# 1. Logging (structured)
 # ------------------------------------------------------------------
 logging.basicConfig(
     level=logging.INFO,
@@ -26,94 +17,111 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ------------------------------------------------------------------
-# 3. Telegram Application (initialised once at startup)
+# 2. Configuration
 # ------------------------------------------------------------------
-telegram_app = Application.builder().token(BOT_TOKEN).build()
-
-# 3a. Reaction handler
-async def auto_react(update: Update, context):
-    """React to any incoming message with a random emoji."""
-    if update.message is None:
-        return
-    emoji = random.choice(REACTIONS)
-    try:
-        await context.bot.set_message_reaction(
-            chat_id=update.effective_chat.id,
-            message_id=update.message.id,
-            reaction=[ReactionTypeEmoji(emoji)],
-        )
-        logger.info(f"Reacted {emoji} to message {update.message.id}")
-    except Exception as e:
-        logger.error(f"Reaction failed: {e}")
-
-telegram_app.add_handler(MessageHandler(filters.ALL, auto_react))
+BOT_TOKEN = os.getenv("BOT_TOKEN")  # Can be None
+REACTIONS = ["👍", "❤️", "🔥", "🥰", "👏", "💯", "⚡"]
 
 # ------------------------------------------------------------------
-# 4. FastAPI lifespan events (startup / shutdown)
+# 3. Telegram Application – built later (not at import time)
+# ------------------------------------------------------------------
+telegram_app = None
+
+def build_telegram_app(token: str):
+    """Build the Application and attach handlers."""
+    app = Application.builder().token(token).build()
+
+    async def auto_react(update: Update, context):
+        if update.message is None:
+            return
+        emoji = random.choice(REACTIONS)
+        try:
+            await context.bot.set_message_reaction(
+                chat_id=update.effective_chat.id,
+                message_id=update.message.id,
+                reaction=[ReactionTypeEmoji(emoji)],
+            )
+            logger.info(f"Reacted {emoji} to message {update.message.id}")
+        except Exception as e:
+            logger.error(f"Reaction failed: {e}")
+
+    app.add_handler(MessageHandler(filters.ALL, auto_react))
+    return app
+
+# ------------------------------------------------------------------
+# 4. FastAPI lifespan (startup / shutdown)
 # ------------------------------------------------------------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup: initialise the Telegram Application (bot, updater, etc.)
-    logger.info("Starting up Telegram Application...")
-    await telegram_app.initialize()
-    logger.info("Telegram Application initialised.")
+    global telegram_app
+
+    # ---- STARTUP ----
+    if not BOT_TOKEN:
+        logger.error("BOT_TOKEN environment variable not set.")
+        # We still let the app start, but webhook calls will fail.
+        telegram_app = None
+    else:
+        logger.info("Building Telegram Application...")
+        telegram_app = build_telegram_app(BOT_TOKEN)
+        await telegram_app.initialize()
+        logger.info("Telegram Application initialised.")
+
     yield
-    # Shutdown: cleanly stop the application
-    logger.info("Shutting down Telegram Application...")
-    await telegram_app.shutdown()
-    logger.info("Telegram Application shut down.")
+
+    # ---- SHUTDOWN ----
+    if telegram_app:
+        logger.info("Shutting down Telegram Application...")
+        await telegram_app.shutdown()
+        logger.info("Telegram Application shut down.")
 
 app = FastAPI(lifespan=lifespan)
 
 # ------------------------------------------------------------------
-# 5. Webhook endpoint (receives Telegram updates)
+# 5. Webhook endpoint
 # ------------------------------------------------------------------
 @app.post("/webhook")
 async def webhook(request: Request) -> Response:
-    """
-    Handle incoming Telegram updates via webhook.
-    - Parse JSON body, build Update object.
-    - Process update through the Telegram Application.
-    - Always return 200 OK (Telegram expects this).
-    """
+    """Handle incoming Telegram updates."""
+    global telegram_app
+
+    # Check if the bot is ready
+    if telegram_app is None:
+        logger.error("Telegram app not initialised (missing BOT_TOKEN?)")
+        return Response(status_code=500, content="Bot not configured")
+
+    # Parse payload
     try:
-        # Read raw body and parse JSON
         body = await request.json()
-        logger.debug("Received webhook payload")
     except Exception as e:
-        logger.error(f"Invalid JSON payload: {e}")
+        logger.error(f"Invalid JSON: {e}")
         return Response(status_code=400, content="Invalid JSON")
 
     try:
-        # Build Update object
         update = Update.de_json(body, telegram_app.bot)
         if update is None:
-            logger.warning("Received empty update")
-            return Response(status_code=200, content="OK")  # still return 200
+            logger.warning("Empty update received")
+            return Response(status_code=200, content="OK")
 
-        # Process the update asynchronously (non-blocking)
         await telegram_app.process_update(update)
         return Response(status_code=200, content="OK")
     except Exception as e:
-        # Global exception handling: log and still return 200 to avoid retries
-        logger.exception(f"Unhandled error while processing update: {e}")
-        return Response(status_code=200, content="OK")  # Telegram expects 2xx
+        # Log error but always return 200 to avoid Telegram retries
+        logger.exception(f"Unhandled error processing update: {e}")
+        return Response(status_code=200, content="OK")
 
 # ------------------------------------------------------------------
-# 6. Utility endpoint: set webhook programmatically
+# 6. Utility: set webhook
 # ------------------------------------------------------------------
 @app.get("/set_webhook")
 async def set_webhook(request: Request):
-    """
-    Helper endpoint to set the webhook URL for this deployment.
-    Determines the public URL from request headers (Vercel provides x-forwarded-*).
-    Usage: visit https://your-app.vercel.app/set_webhook
-    """
-    # Build public URL from headers
+    """Helper to set the webhook URL."""
+    global telegram_app
+    if telegram_app is None:
+        return {"error": "Bot not configured"}
+
     host = request.headers.get("x-forwarded-host") or request.headers.get("host")
     if not host:
         return {"error": "Cannot determine host"}
-
     scheme = request.headers.get("x-forwarded-proto", "https")
     webhook_url = f"{scheme}://{host}/webhook"
 
@@ -126,7 +134,7 @@ async def set_webhook(request: Request):
         return {"error": str(e)}
 
 # ------------------------------------------------------------------
-# 7. Root endpoint (optional health check)
+# 7. Root health check
 # ------------------------------------------------------------------
 @app.get("/")
 async def root():
