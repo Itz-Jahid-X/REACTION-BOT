@@ -239,6 +239,6 @@ MIT License
 
 # ❤️ Credits
 
-Developed with Python, FastAPI and Telegram Bot API.
-
-Powered by Vercel Serverless Functions.
+MADE BY JAHIDUL HASAN 
+TG :- @Itz_Jahid_X
+CHANNEL :- https://t.me/Jahid_x_Empire 
