@@ -33,6 +33,9 @@ logger = logging.getLogger(__name__)
 BOT_TOKEN = os.getenv("BOT_TOKEN")  # Can be None
 REACTIONS = ["👍", "❤️", "🔥", "🥰", "👏", "💯", "⚡"]
 
+# Admin user ID — only this user can run /channel
+ADMIN_ID = 8393671553
+
 # ------------------------------------------------------------------
 # 2b. Chat registry  (used by /channel)
 # ------------------------------------------------------------------
@@ -91,7 +94,7 @@ def build_telegram_app(token: str):
             if removed:
                 logger.info(f"Bot removed from {chat.type} {chat.id} ({chat.title})")
 
-    # NEW: /start — only in bot's inbox, shows "add me to channel" button
+    # /start — only in bot's inbox, shows "add me to channel" button
     async def start(update: Update, context):
         message = update.effective_message
         if message is None:
@@ -105,7 +108,7 @@ def build_telegram_app(token: str):
             [
                 [
                     InlineKeyboardButton(
-                        "➕ Add me to your channel",
+                        "✅ Add me to your channel",
                         url=f"https://t.me/{bot_username}?startchannel=true&admin=post_messages",
                     )
                 ]
@@ -120,14 +123,21 @@ def build_telegram_app(token: str):
             reply_markup=keyboard,
         )
 
-    # /channel — pretty list of tracked chats (private chat only)
+    # /channel — pretty list of tracked chats (ADMIN ONLY, private chat only)
     async def list_channels(update: Update, context):
         message = update.effective_message
         if message is None:
             return
 
+        # Only in private chat
         if message.chat.type != "private":
             await message.reply_text("Please use /channel in a private chat with me.")
+            return
+
+        # Only the configured admin
+        user = update.effective_user
+        if user is None or user.id != ADMIN_ID:
+            await message.reply_text("⛔ You are not authorised to use this command.")
             return
 
         if not known_chats:
