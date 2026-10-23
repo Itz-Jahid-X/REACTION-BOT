@@ -32,16 +32,18 @@ def build_telegram_app(token: str):
     app = Application.builder().token(token).build()
 
     async def auto_react(update: Update, context):
-        if update.message is None:
+        # Works for private/group messages AND channel posts.
+        message = update.effective_message
+        if message is None:
             return
         emoji = random.choice(REACTIONS)
         try:
             await context.bot.set_message_reaction(
-                chat_id=update.effective_chat.id,
-                message_id=update.message.id,
+                chat_id=message.chat_id,
+                message_id=message.message_id,
                 reaction=[ReactionTypeEmoji(emoji)],
             )
-            logger.info(f"Reacted {emoji} to message {update.message.id}")
+            logger.info(f"Reacted {emoji} to message {message.message_id}")
         except Exception as e:
             logger.error(f"Reaction failed: {e}")
 
