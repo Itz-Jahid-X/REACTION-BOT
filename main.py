@@ -4,8 +4,19 @@ import logging
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request, Response
-from telegram import Update, ReactionTypeEmoji
-from telegram.ext import Application, MessageHandler, filters
+from telegram import (
+    Update,
+    ReactionTypeEmoji,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+)
+from telegram.ext import (
+    Application,
+    MessageHandler,
+    CommandHandler,
+    ChatMemberHandler,
+    filters,
+)
 
 # ------------------------------------------------------------------
 # 1. Logging (structured)
@@ -23,6 +34,24 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")  # Can be None
 REACTIONS = ["👍", "❤️", "🔥", "🥰", "👏", "💯", "⚡"]
 
 # ------------------------------------------------------------------
+# 2b. Chat registry  (used by /channel)
+# ------------------------------------------------------------------
+# id -> {"id", "title", "username", "type"}
+known_chats: dict[int, dict] = {}
+
+def track_chat(chat):
+    """Record a channel / group the bot is in."""
+    if chat is None:
+        return
+    if chat.type in ("group", "supergroup", "channel"):
+        known_chats[chat.id] = {
+            "id": chat.id,
+            "title": chat.title or "(no title)",
+            "username": chat.username,     # may be None for private groups
+            "type": chat.type,
+        }
+
+# ------------------------------------------------------------------
 # 3. Telegram Application – built later (not at import time)
 # ------------------------------------------------------------------
 telegram_app = None
@@ -36,6 +65,7 @@ def build_telegram_app(token: str):
         message = update.effective_message
         if message is None:
             return
+        track_chat(message.chat)  # record every chat we hear from
         emoji = random.choice(REACTIONS)
         try:
             await context.bot.set_message_reaction(
@@ -47,7 +77,98 @@ def build_telegram_app(token: str):
         except Exception as e:
             logger.error(f"Reaction failed: {e}")
 
-    app.add_handler(MessageHandler(filters.ALL, auto_react))
+    async def on_my_chat_member(update: Update, context):
+        cmu = update.my_chat_member
+        if cmu is None:
+            return
+        chat = cmu.chat
+        status = cmu.new_chat_member.status
+        if status in ("member", "administrator", "creator"):
+            track_chat(chat)
+            logger.info(f"Bot added to {chat.type} {chat.id} ({chat.title})")
+        elif status in ("left", "kicked"):
+            removed = known_chats.pop(chat.id, None)
+            if removed:
+                logger.info(f"Bot removed from {chat.type} {chat.id} ({chat.title})")
+
+    # NEW: /start — only in bot's inbox, shows "add me to channel" button
+    async def start(update: Update, context):
+        message = update.effective_message
+        if message is None:
+            return
+        # Only respond in private chat — nothing anywhere else
+        if message.chat.type != "private":
+            return
+
+        bot_username = context.bot.username
+        keyboard = InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        "➕ Add me to your channel",
+                        url=f"https://t.me/{bot_username}?startchannel=true&admin=post_messages",
+                    )
+                ]
+            ]
+        )
+        await message.reply_text(
+            "👋 <b>Hi! I'm an auto-reaction bot.</b>\n\n"
+            "Add me to your channel and I'll automatically react "
+            "to every new post with a random emoji.\n\n"
+            "👇 Tap the button below to add me:",
+            parse_mode="HTML",
+            reply_markup=keyboard,
+        )
+
+    # /channel — pretty list of tracked chats (private chat only)
+    async def list_channels(update: Update, context):
+        message = update.effective_message
+        if message is None:
+            return
+
+        if message.chat.type != "private":
+            await message.reply_text("Please use /channel in a private chat with me.")
+            return
+
+        if not known_chats:
+            await message.reply_text(
+                "No channels/groups tracked yet.\n\n"
+                "Add me to a channel/group, or send any message there — "
+                "I'll record it and it will show up here."
+            )
+            return
+
+        items = sorted(known_chats.values(), key=lambda x: (x["title"] or "").lower())
+        n_channel = sum(1 for i in items if i["type"] == "channel")
+        n_group = len(items) - n_channel
+
+        header = (
+            f"📋 <b>Channels &amp; Groups</b>  ({len(items)} total)\n"
+            f"<i>{n_channel} channel(s) · {n_group} group(s)</i>"
+        )
+        lines = [header]
+        for i, info in enumerate(items, 1):
+            username = f"@{info['username']}" if info["username"] else "—"
+            lines.append(
+                f"\n<b>{i}. {info['title']}</b>\n"
+                f"   • ID: <code>{info['id']}</code>\n"
+                f"   • Username: {username}\n"
+                f"   • Type: {info['type']}"
+            )
+
+        text = "\n".join(lines)
+
+        if len(text) > 4000:
+            for i in range(0, len(text), 4000):
+                await message.reply_text(text[i:i + 4000], parse_mode="HTML")
+        else:
+            await message.reply_text(text, parse_mode="HTML")
+
+    app.add_handler(ChatMemberHandler(on_my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("channel", list_channels))
+    # Skip commands so the bot doesn't react to /start, /channel, etc.
+    app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, auto_react))
     return app
 
 # ------------------------------------------------------------------
@@ -60,7 +181,6 @@ async def lifespan(app: FastAPI):
     # ---- STARTUP ----
     if not BOT_TOKEN:
         logger.error("BOT_TOKEN environment variable not set.")
-        # We still let the app start, but webhook calls will fail.
         telegram_app = None
     else:
         logger.info("Building Telegram Application...")
@@ -86,12 +206,10 @@ async def webhook(request: Request) -> Response:
     """Handle incoming Telegram updates."""
     global telegram_app
 
-    # Check if the bot is ready
     if telegram_app is None:
         logger.error("Telegram app not initialised (missing BOT_TOKEN?)")
         return Response(status_code=500, content="Bot not configured")
 
-    # Parse payload
     try:
         body = await request.json()
     except Exception as e:
@@ -107,7 +225,6 @@ async def webhook(request: Request) -> Response:
         await telegram_app.process_update(update)
         return Response(status_code=200, content="OK")
     except Exception as e:
-        # Log error but always return 200 to avoid Telegram retries
         logger.exception(f"Unhandled error processing update: {e}")
         return Response(status_code=200, content="OK")
 
